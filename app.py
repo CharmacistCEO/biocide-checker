@@ -437,8 +437,8 @@ def _parse_li(li, category_full: str) -> EcolifeItem | None:
 
     # 상품명 — 텍스트 첫 부분, "신고번호" 또는 "조치일" 앞까지
     name_text = re.split(r"(신고번호|조치일|신고일|화학제품정보)", text)[0].strip()
-    # [분류] 접두사 제거 가능하지만 그대로 두는 게 정보 더 많음
-    product_name = name_text[:120] if name_text else "(이름 추출 실패)"
+    # ecolife는 검색어 하이라이트 때문에 한글 사이가 띄어져 있음 — 다시 합침
+    product_name = _polish_result_name(name_text)[:120] if name_text else "(이름 추출 실패)"
 
     return EcolifeItem(
         category=_classify(category_full),
@@ -453,6 +453,20 @@ def _parse_li(li, category_full: str) -> EcolifeItem | None:
 # 제품이 아닌 게시판 카테고리 — 제외
 _NON_PRODUCT_CATEGORIES = ("정보마당", "홍보마당", "공지", "Q&A", "질의응답")
 
+# 검색어 정규화 시 제거할 패턴 (규격, 단위, 흔한 부가어)
+_KEYWORD_NOISE_REGEX = re.compile(
+    r"\([^)]*\)"                              # 괄호 안 전체 (무향), (500ml) 등
+    r"|\d+(\.\d+)?\s*(ml|g|mg|kg|L|개|정|캡슐|EA|SET|매)\b"  # 수량 단위
+    r"|\b\d+일\b"                             # "45일" 같은 기간
+    r"|\b(세트|리필|증정|행사)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_for_match(s: str) -> str:
+    """공백 제거 + 소문자 (substring 매칭용)."""
+    return re.sub(r"\s+", "", s).lower()
+
 
 def _matches_keyword(item_text: str, keyword: str) -> bool:
     """검색어가 결과 텍스트에 실제로 포함되는지 확인.
@@ -462,10 +476,77 @@ def _matches_keyword(item_text: str, keyword: str) -> bool:
     """
     if not keyword or len(keyword) < 2:
         return True
-    norm_text = re.sub(r"\s+", "", item_text)
-    norm_kw = re.sub(r"\s+", "", keyword)
-    # 4글자 이상이면 정확 매칭 요구, 짧으면 substring
-    return norm_kw in norm_text
+    return _normalize_for_match(keyword) in _normalize_for_match(item_text)
+
+
+def _shrink_keyword(keyword: str) -> list[str]:
+    """검색어를 점차 짧은 후보로 단축. 첫 번째는 항상 원본.
+
+    예: "홈키파수성에어졸(무향) 500ml" →
+        ['홈키파수성에어졸(무향) 500ml',  # 원본
+         '홈키파수성에어졸',              # 괄호/단위 제거
+         '홈키파 에어졸',                  # 띄어쓰기 토큰
+         '홈키파수성',                     # 한글만 앞 5자
+         '홈키파',                         # 한글만 앞 3자
+         '홈키']                           # 한글만 앞 2자
+    """
+    keyword = keyword.strip()
+    candidates: list[str] = [keyword]
+
+    # 1) 괄호 / 단위 / 부가어 제거
+    cleaned = _KEYWORD_NOISE_REGEX.sub(" ", keyword)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned and cleaned != keyword:
+        candidates.append(cleaned)
+
+    # 2) 공백 분할 토큰 — 앞 N개씩
+    base = cleaned if cleaned else keyword
+    tokens = base.split()
+    if len(tokens) > 1:
+        for n in range(len(tokens) - 1, 0, -1):
+            short = " ".join(tokens[:n]).strip()
+            if short:
+                candidates.append(short)
+
+    # 3) 한글 연속체에서 앞 5,4,3,2글자 (브랜드 추정)
+    hangul_only = re.sub(r"[^가-힣]", "", base)
+    for n in (5, 4, 3, 2):
+        if len(hangul_only) >= n:
+            candidates.append(hangul_only[:n])
+
+    # 중복 제거 (정규화 기준), 1글자 제외
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        if len(c) < 2:
+            continue
+        norm = _normalize_for_match(c)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(c)
+    return out
+
+
+def _polish_result_name(raw: str) -> str:
+    """ecolife 결과에서 BS4 토큰이 띄어진 상품명을 사람이 읽기 좋게 정리."""
+    # 한글 사이의 모든 공백 제거 (lookbehind/lookahead로 한 번에)
+    s = re.sub(r"(?<=[가-힣])\s+(?=[가-힣])", "", raw)
+    # 남은 다중 공백 정리
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def fetch_ecolife_smart(keyword: str) -> tuple[list[EcolifeItem], str]:
+    """검색어를 점차 단축하며 결과가 있을 때까지 시도.
+
+    Returns: (결과 리스트, 실제로 매칭에 성공한 검색어)
+    """
+    for candidate in _shrink_keyword(keyword):
+        results = fetch_ecolife_results(candidate)
+        if results:
+            return results, candidate
+    return [], keyword
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -753,10 +834,13 @@ if not query:
     st.stop()
 
 with st.spinner(f"초록누리에서 `{query}` 검색 중..."):
-    results = fetch_ecolife_results(query)
+    results, used_keyword = fetch_ecolife_smart(query)
 
 if not results:
-    st.warning("초록누리에서 일치하는 결과를 찾지 못했어요.")
+    st.warning(
+        "초록누리에서 일치하는 결과를 찾지 못했어요. "
+        "검색어를 더 짧게(브랜드명만) 입력하거나, 라벨의 승인번호로 검색해보세요."
+    )
     st.link_button(
         "🔗 초록누리 사이트에서 직접 확인",
         ecolife_url(query),
@@ -764,8 +848,12 @@ if not results:
     )
     st.stop()
 
-# 결과 헤더
-st.markdown(f"##### 🔎 검색결과 — `{query}` ({len(results)}건)")
+# 결과 헤더 — 단축 검색이 적용된 경우 알림
+if used_keyword != query:
+    st.caption(
+        f"💡 `{query}` 로는 결과가 없어 `{used_keyword}` 로 자동 확장 검색했습니다."
+    )
+st.markdown(f"##### 🔎 검색결과 — `{used_keyword}` ({len(results)}건)")
 
 # 승인 여부 한눈 요약
 has_aprv = any(it.category == "승인" for it in results)
