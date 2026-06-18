@@ -251,6 +251,63 @@ def lookup_master_name(barcode: str) -> str | None:
     return load_master_db().get(barcode.strip())
 
 
+# 검색어로 떨어지면 안 되는 너무 일반적인 단어 (살충제 분야 일반명사)
+_GENERIC_TERMS = {
+    "바퀴", "모기", "벌레", "곤충", "용도", "용기", "살충", "방충", "기피", "제거",
+    "스프레이", "에어졸", "리퀴드", "베이트", "코일", "매트", "젤", "겔",
+    "실내", "야외", "주방", "거실", "전용", "타입",
+    "용", "성", "제", "형", "장", "통",
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def infer_brand_from_prefix(barcode: str) -> str | None:
+    """같은 GS1 회사 prefix(앞 7자리)를 공유하는 다른 제품들에서 공통 브랜드 추출.
+
+    예: 8801328으로 시작하는 33개 제품 중 30개가 '에프킬라'로 시작 → '에프킬라' 반환.
+    """
+    if not barcode or len(barcode) < 7:
+        return None
+    db = load_master_db()
+    if not db:
+        return None
+    prefix = barcode[:7]
+    siblings = [name for bc, name in db.items() if bc.startswith(prefix) and bc != barcode]
+    if len(siblings) < 5:
+        return None  # 표본 부족
+    # 길이 2~6의 한글 접두사 후보를 빈도로 카운트
+    from collections import Counter
+    candidates: Counter[str] = Counter()
+    for name in siblings:
+        hangul_prefix = re.match(r"^([가-힣]+)", name)
+        if not hangul_prefix:
+            continue
+        h = hangul_prefix.group(1)
+        for n in range(2, min(7, len(h) + 1)):
+            candidates[h[:n]] += 1
+    if not candidates:
+        return None
+    # 50% 이상의 sibling이 공유하는 가장 긴 prefix
+    threshold = max(3, int(len(siblings) * 0.5))
+    valid = [(p, c) for p, c in candidates.items() if c >= threshold]
+    if not valid:
+        return None
+    # 가장 긴, 그 안에서 가장 빈번한
+    return max(valid, key=lambda x: (len(x[0]), x[1]))[0]
+
+
+def _is_too_generic(term: str) -> bool:
+    """검색어가 일반명사 수준이라 단독 검색 시 무관 결과 잔뜩 잡힐 위험."""
+    if not term:
+        return True
+    if term in _GENERIC_TERMS:
+        return True
+    # 흔한 접미사로만 끝나는 짧은 단어
+    if len(term) <= 3 and any(term.endswith(g) for g in ("용", "성", "제", "형")):
+        return True
+    return False
+
+
 def _naver_search_keys() -> tuple[str, str] | None:
     """Streamlit secrets에서 네이버 API 키 읽기."""
     try:
@@ -537,12 +594,42 @@ def _polish_result_name(raw: str) -> str:
     return s
 
 
-def fetch_ecolife_smart(keyword: str) -> tuple[list[EcolifeItem], str]:
+def fetch_ecolife_smart(
+    keyword: str,
+    brand_hint: str | None = None,
+) -> tuple[list[EcolifeItem], str]:
     """검색어를 점차 단축하며 결과가 있을 때까지 시도.
+
+    brand_hint가 주어지면:
+      - 원본 검색어 앞에 brand를 붙인 변형도 우선 시도
+      - 단축 후보가 일반명사로 떨어지면 brand로 대체
 
     Returns: (결과 리스트, 실제로 매칭에 성공한 검색어)
     """
-    for candidate in _shrink_keyword(keyword):
+    candidates = _shrink_keyword(keyword)
+
+    # brand 보강: brand + 원본 정규화의 첫 토큰 / brand 단독
+    if brand_hint:
+        brand_only = brand_hint.strip()
+        boosted: list[str] = []
+        # 원본에 brand가 이미 포함돼 있지 않으면 boosted 후보 추가
+        if _normalize_for_match(brand_only) not in _normalize_for_match(keyword):
+            # "에프킬라" + 원본 키워드 핵심부
+            boosted.append(f"{brand_only} {keyword}")
+            boosted.append(brand_only)
+        candidates = boosted + candidates
+
+    # 일반명사로 떨어지는 단축 후보 제거
+    filtered: list[str] = []
+    for c in candidates:
+        if _is_too_generic(c):
+            continue
+        filtered.append(c)
+    # 모두 제거됐다면 brand_only만 남기거나, 원본 유지
+    if not filtered:
+        filtered = [brand_hint] if brand_hint else [keyword]
+
+    for candidate in filtered:
         results = fetch_ecolife_results(candidate)
         if results:
             return results, candidate
@@ -798,6 +885,10 @@ if db_entry:
     detail_rows = []
     if db_entry.name:
         detail_rows.append(f"<b>상품명</b>: {db_entry.name}")
+    # 바코드 prefix로 추정한 브랜드 (POS 명칭이 모호한 경우 도움)
+    _hint = infer_brand_from_prefix(ss.get("last_scanned") or "")
+    if _hint and _hint not in db_entry.name:
+        detail_rows.append(f"<b>추정 브랜드</b>: {_hint} (바코드 prefix 기반)")
     if db_entry.spec:
         detail_rows.append(f"<b>규격</b>: {db_entry.spec}")
     if db_entry.formulation:
@@ -833,8 +924,13 @@ if not query:
     )
     st.stop()
 
+# 바코드가 알려진 경우 brand 추정 (prefix 기반)
+brand_hint: str | None = None
+if ss.get("last_scanned"):
+    brand_hint = infer_brand_from_prefix(ss.last_scanned)
+
 with st.spinner(f"초록누리에서 `{query}` 검색 중..."):
-    results, used_keyword = fetch_ecolife_smart(query)
+    results, used_keyword = fetch_ecolife_smart(query, brand_hint=brand_hint)
 
 if not results:
     st.warning(
