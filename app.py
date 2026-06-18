@@ -528,6 +528,20 @@ ss.setdefault("db_entry", None)
 st.markdown("### 🪲 살충제 판매제한 조회")
 st.caption("바코드 스캔 → 자동으로 초록누리(ecolife) 결과 표시")
 
+# DB 로드 상태 — 사용자/관리자가 secrets 설정 여부 즉시 확인
+_db = load_product_db()
+_naver_on = bool(_naver_search_keys())
+_status_line = []
+if _db:
+    _status_line.append(f"📚 약국 DB **{len(_db)}개** 로드됨")
+else:
+    _status_line.append("⚠️ 약국 DB 로드 안 됨 (Streamlit Secrets에 `PRODUCT_DB_CSV_URL` 미설정)")
+if _naver_on:
+    _status_line.append("🔑 네이버 API 활성")
+else:
+    _status_line.append("🔓 네이버 API 미설정 (DDG 폴백)")
+st.caption(" · ".join(_status_line))
+
 
 def set_query(new_query: str, hint: str = ""):
     """검색어를 세션 상태에 설정하고 안내 메시지 갱신."""
