@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.log
+.streamlit/secrets.toml
+.venv/
+venv/
+.DS_Store
+Thumbs.db
