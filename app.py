@@ -169,12 +169,8 @@ class ProductDBEntry:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_product_db() -> dict[str, ProductDBEntry]:
-    """Streamlit secrets에 설정된 구글 시트 CSV URL을 fetch해서 바코드 dict로."""
-    try:
-        url = st.secrets.get("PRODUCT_DB_CSV_URL", "")
-    except Exception:
-        url = ""
+def _load_product_db_cached(url: str) -> dict[str, ProductDBEntry]:
+    """캐싱되는 내부 구현. URL이 키이므로 secrets 변경 시 자동 무효화."""
     if not url:
         return {}
     try:
@@ -201,6 +197,19 @@ def load_product_db() -> dict[str, ProductDBEntry]:
         return db
     except Exception:
         return {}
+
+
+def load_product_db() -> dict[str, ProductDBEntry]:
+    """Streamlit secrets에 설정된 구글 시트 CSV URL을 fetch해서 바코드 dict로.
+
+    캐시 키가 URL 자체이므로, secrets 변경 시 자동으로 새 캐시 항목 생성됨
+    (이전 빈 dict 캐시가 막지 못함).
+    """
+    try:
+        url = st.secrets.get("PRODUCT_DB_CSV_URL", "")
+    except Exception:
+        url = ""
+    return _load_product_db_cached(url)
 
 
 def lookup_db_by_barcode(barcode: str) -> ProductDBEntry | None:
