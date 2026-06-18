@@ -27,6 +27,14 @@ try:
 except Exception:
     SCANNER_OK = False
 
+try:
+    import pytesseract
+    pytesseract.get_tesseract_version()
+    OCR_OK = True
+except Exception as _e:
+    OCR_OK = False
+    OCR_ERR = repr(_e)
+
 
 # ─────────────────────────── 상수 ───────────────────────────
 
@@ -121,13 +129,56 @@ def _is_valid_product_name(name: str, barcode: str) -> bool:
     return True
 
 
+def _naver_search_keys() -> tuple[str, str] | None:
+    """Streamlit secrets에서 네이버 API 키 읽기."""
+    try:
+        cid = st.secrets.get("NAVER_CLIENT_ID", "")
+        csec = st.secrets.get("NAVER_CLIENT_SECRET", "")
+    except Exception:
+        return None
+    if cid and csec:
+        return cid, csec
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def lookup_product_name(barcode: str) -> str | None:
-    """바코드 → 상품명 후보 1개. 실패 시 None."""
+    """바코드 → 상품명 후보 1개. 실패 시 None.
+
+    우선순위:
+      1. 네이버 검색 API (정식, 안정) — secrets에 키 설정된 경우
+      2. DuckDuckGo HTML 스크래핑 (폴백)
+      3. Open Food Facts (식품 한정)
+    """
     if not barcode:
         return None
 
-    # 1) DuckDuckGo
+    # 1) 네이버 쇼핑 검색 API — 안정적, Korean-friendly
+    keys = _naver_search_keys()
+    if keys:
+        cid, csec = keys
+        try:
+            r = requests.get(
+                "https://openapi.naver.com/v1/search/shop.json",
+                params={"query": barcode, "display": 5, "sort": "sim"},
+                headers={
+                    "X-Naver-Client-Id": cid,
+                    "X-Naver-Client-Secret": csec,
+                },
+                timeout=8,
+            )
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                for it in items:
+                    raw = it.get("title", "")
+                    # 제목에 <b>...</b> 하이라이트 태그 있음 → 제거
+                    name = re.sub(r"</?b>", "", raw).strip()
+                    if _is_valid_product_name(name, barcode):
+                        return name
+        except Exception:
+            pass
+
+    # 2) DuckDuckGo (폴백)
     try:
         r = requests.post(
             "https://html.duckduckgo.com/html/",
@@ -150,12 +201,12 @@ def lookup_product_name(barcode: str) -> str | None:
     except Exception:
         pass
 
-    # 2) Open Food Facts
+    # 3) Open Food Facts
     try:
         r = requests.get(
             f"https://world.openfoodfacts.org/api/v2/product/{urllib.parse.quote(barcode)}.json",
             timeout=8,
-            headers={"User-Agent": "biocide-checker/0.3"},
+            headers={"User-Agent": "biocide-checker/0.4"},
         )
         if r.status_code == 200:
             data = r.json()
@@ -169,6 +220,60 @@ def lookup_product_name(barcode: str) -> str | None:
         pass
 
     return None
+
+
+# ─────────────────────────── OCR (라벨 텍스트 추출) ───────────────────────────
+
+# 살생물제 승인번호 패턴: 4자리-4자리 (예: 3219-0052) 또는 2자리-4자리 (2219-0365)
+_APPROVAL_NO_REGEX = re.compile(r"\b\d{4}-\d{4}\b")
+# 생활화학제품 신고번호 패턴: [A-Z]{1,2}\d{2}-\d{2}-\d{4} (예: CB22-12-2426)
+_DCLR_NO_REGEX = re.compile(r"\b[A-Z]{1,2}\d{2}-\d{2}-\d{4}\b")
+
+
+@dataclass
+class OcrResult:
+    approval_numbers: list[str]   # 승인/신고번호 후보
+    product_name_candidates: list[str]  # 상품명 후보 (긴 한글 텍스트 줄)
+
+
+def ocr_extract(image_bytes: bytes) -> OcrResult:
+    """라벨 사진에서 텍스트 추출 후 의미있는 후보 정리."""
+    if not OCR_OK:
+        return OcrResult([], [])
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+        # 한국어 + 영어 함께
+        text = pytesseract.image_to_string(img, lang="kor+eng")
+    except Exception:
+        return OcrResult([], [])
+
+    # 승인/신고번호 후보
+    approvals = list(dict.fromkeys(
+        _APPROVAL_NO_REGEX.findall(text) + _DCLR_NO_REGEX.findall(text)
+    ))
+
+    # 상품명 후보: 한글 5자 이상 라인, 길이 6~60
+    raw_lines = [line.strip() for line in text.splitlines()]
+    name_candidates: list[str] = []
+    for line in raw_lines:
+        if not line or len(line) < 6 or len(line) > 60:
+            continue
+        # 한글 비율 30% 이상
+        hangul = len(re.findall(r"[가-힣]", line))
+        if hangul < 3 or hangul / len(line) < 0.3:
+            continue
+        # 흔한 라벨 텍스트 (성분, 주의사항 등) 제거
+        if any(skip in line for skip in (
+            "성분", "주의", "용도", "보관", "유통기한", "제조원", "환경부",
+            "사용방법", "응급조치", "개봉", "재활용", "허가", "함량",
+        )):
+            continue
+        name_candidates.append(line)
+
+    # 중복 제거
+    name_candidates = list(dict.fromkeys(name_candidates))[:8]
+    return OcrResult(approval_numbers=approvals, product_name_candidates=name_candidates)
 
 
 def _classify(category_full: str) -> str:
@@ -365,27 +470,54 @@ with st.container():
                 set_query("", f"바코드 `{scanned}` 인식했으나 상품명 자동 조회 실패 — 아래에 직접 입력하세요")
                 st.rerun()
 
-    # 사진 업로드 (스캐너가 안 되는 환경 대비)
-    with st.expander("📷 사진 업로드로 바코드 인식", expanded=False):
+    # 사진 업로드 — 바코드 + OCR 동시 처리
+    with st.expander("📷 라벨/바코드 사진으로 인식 (바코드 + OCR 동시)", expanded=False):
+        st.caption(
+            "라벨 앞면 또는 바코드를 찍어 올리세요. "
+            "바코드, 승인번호, 상품명을 한 번에 인식합니다."
+        )
         uploaded = st.file_uploader(
-            "바코드 사진을 선택하세요",
+            "사진을 선택하세요",
             type=["png", "jpg", "jpeg", "webp"],
             label_visibility="collapsed",
         )
         if uploaded is not None:
-            code = decode_barcode_image(uploaded.getvalue())
-            if code and code != ss.last_scanned:
-                ss.last_scanned = code
-                with st.spinner("상품명 조회 중..."):
-                    name = lookup_product_name(code)
-                if name:
-                    set_query(name, f"바코드 `{code}` → 상품명 자동 인식")
-                    st.rerun()
+            img_bytes = uploaded.getvalue()
+            # 1) 바코드 시도
+            code = decode_barcode_image(img_bytes)
+            # 2) OCR 시도 (Tesseract 가용한 환경에서만 실제 동작)
+            ocr_res = ocr_extract(img_bytes) if OCR_OK else OcrResult([], [])
+
+            # 후보들 종합
+            options: list[tuple[str, str]] = []  # (label, query_value)
+            if code:
+                with st.spinner("바코드 상품명 조회 중..."):
+                    bc_name = lookup_product_name(code)
+                if bc_name:
+                    options.append((f"📦 바코드 매칭: {bc_name}", bc_name))
                 else:
-                    set_query("", f"바코드 `{code}` 인식했으나 상품명 자동 조회 실패 — 아래에 직접 입력하세요")
-                    st.rerun()
-            elif uploaded and not code:
-                st.error("바코드를 찾지 못했어요. 더 선명한 사진으로 다시 시도해주세요.")
+                    options.append((f"🔢 바코드 번호로 검색: {code}", code))
+            for ano in ocr_res.approval_numbers:
+                options.append((f"✅ 승인/신고번호: {ano}", ano))
+            for name in ocr_res.product_name_candidates:
+                options.append((f"📝 OCR 상품명 후보: {name}", name))
+
+            if not options:
+                st.error(
+                    "바코드도 텍스트도 인식하지 못했어요. "
+                    "더 선명하게, 라벨이 정면으로 보이도록 다시 찍어주세요."
+                )
+            else:
+                st.success(f"{len(options)}개 후보 인식됨 — 검색할 항목을 선택하세요")
+                for idx, (label, value) in enumerate(options):
+                    if st.button(label, key=f"opt_{idx}", use_container_width=True):
+                        set_query(value, f"선택: {label}")
+                        st.rerun()
+                if not OCR_OK:
+                    st.caption(
+                        "ℹ️ 로컬 환경에서는 OCR이 비활성화돼 있습니다 "
+                        "(Streamlit Cloud 배포본에서만 동작)."
+                    )
 
     # 텍스트 검색 — 자동 인식 실패 시에도 같은 자리에서 폴백
     new_query = st.text_input(
