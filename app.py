@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import csv
 import io
 import re
 import urllib.parse
@@ -127,6 +128,85 @@ def _is_valid_product_name(name: str, barcode: str) -> bool:
     if len(words) <= 2 and _SITE_SUFFIX_REGEX.search(name):
         return False
     return True
+
+
+# ─────────────────────────── 자체 제품 DB (구글 시트) ───────────────────────────
+
+# 시트 컬럼: 상품명 / 규격 / 제형 / 표준바코드 / 대조결과 / 7월이후_판매 /
+#           매칭_승인제품(참고) / 비고
+SALES_STATUS_STYLE = {
+    "판매가능": ("✅", "#dcfce7", "#16a34a", "판매 가능"),
+    "판매중단": ("🚫", "#fee2e2", "#dc2626", "판매 중단"),
+    "개별확인": ("⚠️", "#fef3c7", "#d97706", "개별 확인 필수"),
+}
+
+
+@dataclass
+class ProductDBEntry:
+    name: str              # 상품명
+    spec: str              # 규격
+    formulation: str       # 제형
+    barcode: str           # 표준바코드
+    comparison: str        # 대조결과
+    sales_status: str      # 7월이후_판매
+    matched_approval: str  # 매칭_승인제품(참고)
+    note: str              # 비고
+
+    @property
+    def status_key(self) -> str:
+        """판매상태 분류 키 — 색상 매핑용."""
+        s = self.sales_status
+        if "가능" in s:
+            return "판매가능"
+        if "중단" in s or "불가" in s:
+            return "판매중단"
+        return "개별확인"
+
+    @property
+    def search_keyword(self) -> str:
+        """ecolife 검색에 쓸 가장 유망한 키워드."""
+        return (self.matched_approval or self.name).strip()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_product_db() -> dict[str, ProductDBEntry]:
+    """Streamlit secrets에 설정된 구글 시트 CSV URL을 fetch해서 바코드 dict로."""
+    try:
+        url = st.secrets.get("PRODUCT_DB_CSV_URL", "")
+    except Exception:
+        url = ""
+    if not url:
+        return {}
+    try:
+        r = requests.get(url, timeout=10, allow_redirects=True)
+        if r.status_code != 200 or "csv" not in r.headers.get("Content-Type", "").lower():
+            return {}
+        text = r.content.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        db: dict[str, ProductDBEntry] = {}
+        for row in reader:
+            bc = (row.get("표준바코드") or "").strip()
+            if not bc:
+                continue
+            db[bc] = ProductDBEntry(
+                name=(row.get("상품명") or "").strip(),
+                spec=(row.get("규격") or "").strip(),
+                formulation=(row.get("제형") or "").strip(),
+                barcode=bc,
+                comparison=(row.get("대조결과") or "").strip(),
+                sales_status=(row.get("7월이후_판매") or "").strip(),
+                matched_approval=(row.get("매칭_승인제품(참고)") or "").strip(),
+                note=(row.get("비고") or "").strip(),
+            )
+        return db
+    except Exception:
+        return {}
+
+
+def lookup_db_by_barcode(barcode: str) -> ProductDBEntry | None:
+    if not barcode:
+        return None
+    return load_product_db().get(barcode.strip())
 
 
 def _naver_search_keys() -> tuple[str, str] | None:
@@ -443,6 +523,7 @@ ss = st.session_state
 ss.setdefault("query", "")
 ss.setdefault("last_scanned", None)
 ss.setdefault("source_hint", "")
+ss.setdefault("db_entry", None)
 
 st.markdown("### 🪲 살충제 판매제한 조회")
 st.caption("바코드 스캔 → 자동으로 초록누리(ecolife) 결과 표시")
@@ -454,6 +535,24 @@ def set_query(new_query: str, hint: str = ""):
     ss.source_hint = hint
 
 
+def handle_scanned_barcode(barcode: str):
+    """바코드 인식 후 DB 조회 우선, 폴백으로 네이버/DDG."""
+    # 1) 자체 DB 우선
+    entry = lookup_db_by_barcode(barcode)
+    if entry:
+        ss.db_entry = entry
+        set_query(entry.search_keyword, f"바코드 `{barcode}` → 약국 DB 매칭")
+        return
+    # 2) 네이버/DDG 폴백
+    ss.db_entry = None
+    with st.spinner("상품명 자동 조회 중..."):
+        name = lookup_product_name(barcode)
+    if name:
+        set_query(name, f"바코드 `{barcode}` → 상품명 자동 인식")
+    else:
+        set_query("", f"바코드 `{barcode}` 인식했으나 자동 조회 실패 — 직접 입력해주세요")
+
+
 # ── 입력 영역 ──
 with st.container():
     # 실시간 스캐너
@@ -461,14 +560,8 @@ with st.container():
         scanned = qrcode_scanner(key="scanner")
         if scanned and scanned != ss.last_scanned:
             ss.last_scanned = scanned
-            with st.spinner("상품명 조회 중..."):
-                name = lookup_product_name(scanned)
-            if name:
-                set_query(name, f"바코드 `{scanned}` → 상품명 자동 인식")
-                st.rerun()
-            else:
-                set_query("", f"바코드 `{scanned}` 인식했으나 상품명 자동 조회 실패 — 아래에 직접 입력하세요")
-                st.rerun()
+            handle_scanned_barcode(scanned)
+            st.rerun()
 
     # 사진 업로드 — 바코드 + OCR 동시 처리
     with st.expander("📷 라벨/바코드 사진으로 인식 (바코드 + OCR 동시)", expanded=False):
@@ -491,12 +584,21 @@ with st.container():
             # 후보들 종합
             options: list[tuple[str, str]] = []  # (label, query_value)
             if code:
-                with st.spinner("바코드 상품명 조회 중..."):
-                    bc_name = lookup_product_name(code)
-                if bc_name:
-                    options.append((f"📦 바코드 매칭: {bc_name}", bc_name))
+                # DB 우선
+                db_entry = lookup_db_by_barcode(code)
+                if db_entry:
+                    ss.db_entry = db_entry
+                    options.append((
+                        f"📚 약국 DB 매칭: {db_entry.name} → {db_entry.search_keyword}",
+                        db_entry.search_keyword,
+                    ))
                 else:
-                    options.append((f"🔢 바코드 번호로 검색: {code}", code))
+                    with st.spinner("바코드 상품명 조회 중..."):
+                        bc_name = lookup_product_name(code)
+                    if bc_name:
+                        options.append((f"📦 바코드 매칭: {bc_name}", bc_name))
+                    else:
+                        options.append((f"🔢 바코드 번호로 검색: {code}", code))
             for ano in ocr_res.approval_numbers:
                 options.append((f"✅ 승인/신고번호: {ano}", ano))
             for name in ocr_res.product_name_candidates:
@@ -534,6 +636,43 @@ with st.container():
         st.caption(ss.source_hint)
 
 # ── 결과 영역 ──
+
+# 1) 약국 DB 매칭 결과 우선 표시 (있으면)
+db_entry: ProductDBEntry | None = ss.get("db_entry")
+if db_entry:
+    icon, bg, fg, status_label = SALES_STATUS_STYLE.get(
+        db_entry.status_key, ("📦", "#f3f4f6", "#6b7280", db_entry.sales_status or "확인 필요")
+    )
+    detail_rows = []
+    if db_entry.name:
+        detail_rows.append(f"<b>상품명</b>: {db_entry.name}")
+    if db_entry.spec:
+        detail_rows.append(f"<b>규격</b>: {db_entry.spec}")
+    if db_entry.formulation:
+        detail_rows.append(f"<b>제형</b>: {db_entry.formulation}")
+    if db_entry.matched_approval:
+        detail_rows.append(f"<b>매칭 승인제품</b>: {db_entry.matched_approval}")
+    if db_entry.comparison:
+        detail_rows.append(f"<b>대조결과</b>: {db_entry.comparison}")
+    if db_entry.note:
+        detail_rows.append(f"<b>비고</b>: {db_entry.note}")
+    detail_html = "<br>".join(detail_rows)
+
+    st.markdown(
+        f"""
+        <div class="card" style="border-left:6px solid {fg}; background:{bg};">
+            <div style="font-size:0.85rem;font-weight:600;color:{fg};margin-bottom:4px;">
+                📚 약국 DB 매칭 결과
+            </div>
+            <div style="font-size:1.4rem;font-weight:800;color:{fg};margin-bottom:8px;">
+                {icon} {status_label}
+            </div>
+            <div class="meta">{detail_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 query = (ss.query or "").strip()
 if not query:
     st.info(
