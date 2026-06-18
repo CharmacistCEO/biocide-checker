@@ -218,6 +218,39 @@ def lookup_db_by_barcode(barcode: str) -> ProductDBEntry | None:
     return load_product_db().get(barcode.strip())
 
 
+# ─────────────────────────── 로컬 약국 마스터 (xlsx 추출본) ───────────────────────────
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_master_db() -> dict[str, str]:
+    """리포에 포함된 약국 마스터 CSV (17,670 제품). 바코드 → 상품명."""
+    import pathlib
+    p = pathlib.Path(__file__).parent / "data" / "product_master.csv"
+    if not p.exists():
+        return {}
+    db: dict[str, str] = {}
+    try:
+        with p.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = (row.get("상품명") or "").strip()
+                if not name:
+                    continue
+                # 4개 바코드 컬럼 모두 키로 등록 (다양한 형태의 바코드 매칭)
+                for k in ("표준바코드", "본사바코드", "대표바코드", "물류바코드"):
+                    bc = (row.get(k) or "").strip()
+                    if bc and bc not in db:
+                        db[bc] = name
+        return db
+    except Exception:
+        return {}
+
+
+def lookup_master_name(barcode: str) -> str | None:
+    if not barcode:
+        return None
+    return load_master_db().get(barcode.strip())
+
+
 def _naver_search_keys() -> tuple[str, str] | None:
     """Streamlit secrets에서 네이버 API 키 읽기."""
     try:
@@ -537,18 +570,23 @@ ss.setdefault("db_entry", None)
 st.markdown("### 🪲 살충제 판매제한 조회")
 st.caption("바코드 스캔 → 자동으로 초록누리(ecolife) 결과 표시")
 
-# DB 로드 상태 — 사용자/관리자가 secrets 설정 여부 즉시 확인
+# 로드 상태 — 살충제 DB(시트) + 약국 마스터(로컬) + 네이버 API
 _db = load_product_db()
+_master = load_master_db()
 _naver_on = bool(_naver_search_keys())
 _status_line = []
 if _db:
-    _status_line.append(f"📚 약국 DB **{len(_db)}개** 로드됨")
+    _status_line.append(f"📚 살충제 DB **{len(_db)}개**")
 else:
-    _status_line.append("⚠️ 약국 DB 로드 안 됨 (Streamlit Secrets에 `PRODUCT_DB_CSV_URL` 미설정)")
+    _status_line.append("⚠️ 살충제 DB 로드 안 됨")
+if _master:
+    _status_line.append(f"📋 약국 마스터 **{len(_master):,}개**")
+else:
+    _status_line.append("⚠️ 약국 마스터 없음")
 if _naver_on:
     _status_line.append("🔑 네이버 API 활성")
 else:
-    _status_line.append("🔓 네이버 API 미설정 (DDG 폴백)")
+    _status_line.append("🔓 네이버 미설정")
 st.caption(" · ".join(_status_line))
 
 
@@ -559,19 +597,24 @@ def set_query(new_query: str, hint: str = ""):
 
 
 def handle_scanned_barcode(barcode: str):
-    """바코드 인식 후 DB 조회 우선, 폴백으로 네이버/DDG."""
-    # 1) 자체 DB 우선
+    """바코드 인식 후 우선순위 조회: 살충제 DB → 약국 마스터 → 네이버 → DDG."""
+    ss.db_entry = None
+    # 1) 살충제 사전판단 DB (구글시트, 272개)
     entry = lookup_db_by_barcode(barcode)
     if entry:
         ss.db_entry = entry
-        set_query(entry.search_keyword, f"바코드 `{barcode}` → 약국 DB 매칭")
+        set_query(entry.search_keyword, f"바코드 `{barcode}` → 약국 살충제 DB 매칭")
         return
-    # 2) 네이버/DDG 폴백
-    ss.db_entry = None
+    # 2) 약국 마스터 (로컬 CSV, 17,670개)
+    name = lookup_master_name(barcode)
+    if name:
+        set_query(name, f"바코드 `{barcode}` → 약국 마스터 매칭: {name}")
+        return
+    # 3) 외부 검색 (네이버 → DDG)
     with st.spinner("상품명 자동 조회 중..."):
         name = lookup_product_name(barcode)
     if name:
-        set_query(name, f"바코드 `{barcode}` → 상품명 자동 인식")
+        set_query(name, f"바코드 `{barcode}` → 외부 검색: {name}")
     else:
         set_query("", f"바코드 `{barcode}` 인식했으나 자동 조회 실패 — 직접 입력해주세요")
 
@@ -607,21 +650,26 @@ with st.container():
             # 후보들 종합
             options: list[tuple[str, str]] = []  # (label, query_value)
             if code:
-                # DB 우선
+                # 1) 살충제 DB
                 db_entry = lookup_db_by_barcode(code)
                 if db_entry:
                     ss.db_entry = db_entry
                     options.append((
-                        f"📚 약국 DB 매칭: {db_entry.name} → {db_entry.search_keyword}",
+                        f"📚 약국 살충제 DB: {db_entry.name} → {db_entry.search_keyword}",
                         db_entry.search_keyword,
                     ))
                 else:
-                    with st.spinner("바코드 상품명 조회 중..."):
-                        bc_name = lookup_product_name(code)
-                    if bc_name:
-                        options.append((f"📦 바코드 매칭: {bc_name}", bc_name))
+                    # 2) 약국 마스터
+                    master_name = lookup_master_name(code)
+                    if master_name:
+                        options.append((f"📋 약국 마스터: {master_name}", master_name))
                     else:
-                        options.append((f"🔢 바코드 번호로 검색: {code}", code))
+                        with st.spinner("바코드 상품명 조회 중..."):
+                            bc_name = lookup_product_name(code)
+                        if bc_name:
+                            options.append((f"📦 외부 검색: {bc_name}", bc_name))
+                        else:
+                            options.append((f"🔢 바코드 번호로 검색: {code}", code))
             for ano in ocr_res.approval_numbers:
                 options.append((f"✅ 승인/신고번호: {ano}", ano))
             for name in ocr_res.product_name_candidates:
