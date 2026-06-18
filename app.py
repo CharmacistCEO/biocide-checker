@@ -81,20 +81,98 @@ def decode_barcode(image_bytes: bytes):
         return None, None, f"디코딩 오류: {e}"
 
 
+# 결과 정제용 — 상품명이 아닌 노이즈 패턴
+_NOISE_KEYWORDS = (
+    "송장", "택배", "배송조회", "운송장", "조회한", "홍보 페이지",
+    "광고", "더보기", "본문 바로가기", "이전페이지", "인플루언서",
+    "코리안넷", "Dreamdepot",
+)
+# 사이트/쇼핑몰 이름으로 끝나는 패턴 (단독 상품명이 아닐 가능성 ↑)
+_SITE_SUFFIX_REGEX = re.compile(
+    r"(마트|스토어|쇼핑몰|쇼핑|샵|상점|닷컴|Mall|Store|Shop|Market)$",
+    re.IGNORECASE,
+)
+_NOISE_REGEX = re.compile(
+    r"^(naver|google|daum|bing|쿠팡|지마켓|옥션|11번가|티몬|위메프|네이버|다음|이마트)\b",
+    re.IGNORECASE,
+)
+_DOMAIN_REGEX = re.compile(r"\.(co\.kr|com|net|org|kr)(/|$|\s)", re.IGNORECASE)
+
+
+def _clean_candidate(raw: str) -> str:
+    """검색 결과 텍스트에서 상품명 핵심 부분만 추출."""
+    t = re.sub(r"\s+", " ", raw).strip()
+    # 구분자 앞부분만 ('홈키파 에어졸 무향 (500ml)ㅣ롯데마트 제타...' → '홈키파 에어졸 무향 (500ml)')
+    t = re.split(r"[ㅣ|·•‧]|\s+-\s+|\s+:\s+|\s+\|\s+", t, maxsplit=1)[0].strip()
+    return t
+
+
+def _is_valid_product_name(name: str, barcode: str) -> bool:
+    """상품명으로 쓸만한 후보인지 판단."""
+    if not name or len(name) < 6 or len(name) > 120:
+        return False
+    if barcode in name:
+        return False
+    # 한글이 최소 2글자 이상 (영문 사이트명/URL 배제)
+    if len(re.findall(r"[가-힣]", name)) < 2:
+        return False
+    if any(kw in name for kw in _NOISE_KEYWORDS):
+        return False
+    if _NOISE_REGEX.search(name):
+        return False
+    if _DOMAIN_REGEX.search(name):
+        return False
+    # 한 단어로만 구성되고 사이트성 접미사로 끝나면 사이트명일 가능성 ↑
+    words = name.split()
+    if len(words) <= 2 and _SITE_SUFFIX_REGEX.search(name):
+        return False
+    return True
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def lookup_product_name(barcode: str) -> list[tuple[str, str]]:
-    """바코드로 상품명 후보 검색. (소스, 상품명) 리스트 반환."""
+    """바코드로 상품명 후보 검색. (소스, 상품명) 리스트 반환.
+
+    소스 우선순위:
+      1. DuckDuckGo HTML 검색 — 가장 안정적, 송장 추론 안 함
+      2. Open Food Facts — 식품 한정이지만 정확
+    """
     if not barcode:
         return []
 
-    candidates: list[tuple[str, str]] = []
+    raw_candidates: list[tuple[str, str]] = []
 
-    # 1) Open Food Facts — 글로벌 무료 DB, 일부 한국 제품 포함
+    # 1) DuckDuckGo HTML — 송장번호 추론 안 함
+    #    status 202 는 봇 차단 페이지를 의미 (DDG가 가끔 띄움)
+    try:
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": barcode},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+                ),
+                "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            },
+            timeout=10,
+        )
+        if r.status_code == 200 and "result__a" in r.text:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a.result__a")[:10]:
+                raw = a.get_text(" ", strip=True)
+                cleaned = _clean_candidate(raw)
+                if _is_valid_product_name(cleaned, barcode):
+                    raw_candidates.append(("웹검색", cleaned))
+    except Exception:
+        pass
+
+    # 2) Open Food Facts — 식품 한정이지만 정확
     try:
         r = requests.get(
             f"https://world.openfoodfacts.org/api/v2/product/{urllib.parse.quote(barcode)}.json",
             timeout=8,
-            headers={"User-Agent": "ecolife-lookup/0.1 (personal use)"},
+            headers={"User-Agent": "biocide-checker/0.2"},
         )
         if r.status_code == 200:
             data = r.json()
@@ -103,58 +181,21 @@ def lookup_product_name(barcode: str) -> list[tuple[str, str]]:
                 for key in ("product_name_ko", "product_name", "generic_name_ko", "generic_name"):
                     v = p.get(key)
                     if v and isinstance(v, str) and v.strip():
-                        candidates.append(("Open Food Facts", v.strip()))
+                        raw_candidates.append(("Open Food Facts", v.strip()))
                         break
     except Exception:
         pass
 
-    # 2) 네이버 모바일 통합검색 스크래핑
-    try:
-        url = f"https://m.search.naver.com/search.naver?query={urllib.parse.quote(barcode)}"
-        r = requests.get(
-            url,
-            headers={"User-Agent": MOBILE_UA, "Accept-Language": "ko-KR,ko;q=0.9"},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            selectors = [
-                "a.tit",
-                "strong.tit",
-                "div.title_area a",
-                "a.api_txt_lines.total_tit",
-                "h3.tit",
-                "strong.title",
-            ]
-            found: list[str] = []
-            for sel in selectors:
-                for el in soup.select(sel):
-                    t = el.get_text(" ", strip=True)
-                    t = re.sub(r"\s+", " ", t)
-                    if not t or len(t) < 3 or len(t) > 200:
-                        continue
-                    if barcode in t:
-                        continue
-                    if t.lower().startswith(("네이버", "더보기", "광고")):
-                        continue
-                    found.append(t)
-                if len(found) >= 3:
-                    break
-            for t in found[:5]:
-                candidates.append(("네이버 검색", t))
-    except Exception:
-        pass
-
-    # 중복 제거
+    # 중복 제거 (정규화된 이름 기준)
     seen: set[str] = set()
     uniq: list[tuple[str, str]] = []
-    for src, name in candidates:
+    for src, name in raw_candidates:
         k = re.sub(r"\s+", " ", name).strip().lower()
         if k in seen:
             continue
         seen.add(k)
         uniq.append((src, name))
-    return uniq
+    return uniq[:5]
 
 
 # ─────────────────────────── UI ───────────────────────────
@@ -239,7 +280,7 @@ if st.session_state.get("barcode"):
     if candidates:
         labels = [f"[{src}] {name}" for src, name in candidates]
         idx = st.radio(
-            "후보 상품명",
+            "후보 상품명 (틀리면 3단계에서 직접 수정)",
             options=list(range(len(labels))),
             format_func=lambda i: labels[i],
             index=0,
@@ -247,8 +288,22 @@ if st.session_state.get("barcode"):
         default_name = candidates[idx][1]
     else:
         st.warning(
-            "자동 조회 결과가 없습니다. 상품명을 라벨에서 확인하여 아래에 직접 입력하세요."
+            "자동 조회 결과가 없습니다. 아래 버튼으로 직접 확인하거나, "
+            "3단계 검색어 칸에 상품명을 직접 입력하세요."
         )
+        col_n, col_g = st.columns(2)
+        with col_n:
+            st.link_button(
+                "🔎 네이버 쇼핑에서 직접 찾기",
+                f"https://msearch.shopping.naver.com/search/all?query={urllib.parse.quote(bc)}",
+                use_container_width=True,
+            )
+        with col_g:
+            st.link_button(
+                "🔎 구글에서 직접 찾기",
+                f"https://www.google.com/search?q={urllib.parse.quote(bc)}",
+                use_container_width=True,
+            )
 
     # 3단계: 초록누리 검색
     st.divider()
