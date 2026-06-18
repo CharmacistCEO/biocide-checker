@@ -585,6 +585,24 @@ def _shrink_keyword(keyword: str) -> list[str]:
     return out
 
 
+def _name_similarity(query: str, result: str) -> float:
+    """검색어와 결과 제품명의 한글 bigram 유사도 (0~1).
+
+    - 1.0  : 검색어의 모든 bigram이 결과에 등장 (정확 매칭 or 검색어가 결과의 substring)
+    - 0.7+ : 매우 유사 (몇 글자 차이)
+    - 0.3- : 거의 무관 (브랜드만 공통 같은 경우)
+    """
+    q_norm = re.sub(r"[^가-힣]", "", query)
+    r_norm = re.sub(r"[^가-힣]", "", result)
+    if len(q_norm) < 2 or len(r_norm) < 2:
+        return 0.0
+    q_grams = {q_norm[i:i + 2] for i in range(len(q_norm) - 1)}
+    r_grams = {r_norm[i:i + 2] for i in range(len(r_norm) - 1)}
+    if not q_grams:
+        return 0.0
+    return len(q_grams & r_grams) / len(q_grams)
+
+
 def _polish_result_name(raw: str) -> str:
     """ecolife 결과에서 BS4 토큰이 띄어진 상품명을 사람이 읽기 좋게 정리."""
     # 한글 사이의 모든 공백 제거 (lookbehind/lookahead로 한 번에)
@@ -597,43 +615,42 @@ def _polish_result_name(raw: str) -> str:
 def fetch_ecolife_smart(
     keyword: str,
     brand_hint: str | None = None,
+    min_similarity: float = 0.5,
 ) -> tuple[list[EcolifeItem], str]:
-    """검색어를 점차 단축하며 결과가 있을 때까지 시도.
+    """검색어를 점차 단축하며 결과를 찾되, 원본과의 유사도로 필터링.
 
-    brand_hint가 주어지면:
-      - 원본 검색어 앞에 brand를 붙인 변형도 우선 시도
-      - 단축 후보가 일반명사로 떨어지면 brand로 대체
+    brand_hint가 주어지면 brand 보강 검색어를 우선 시도.
+    단, 모든 결과는 ORIGINAL keyword 기준 유사도 >= min_similarity 만 표시.
+    무관한 brand-only 매칭이 잔뜩 잡히는 것을 방지.
 
-    Returns: (결과 리스트, 실제로 매칭에 성공한 검색어)
+    Returns: (필터링된 결과 리스트, 매칭 성공한 검색어)
     """
-    candidates = _shrink_keyword(keyword)
+    original = keyword.strip()
+    candidates = _shrink_keyword(original)
 
-    # brand 보강: brand + 원본 정규화의 첫 토큰 / brand 단독
+    # brand 보강
     if brand_hint:
         brand_only = brand_hint.strip()
-        boosted: list[str] = []
-        # 원본에 brand가 이미 포함돼 있지 않으면 boosted 후보 추가
-        if _normalize_for_match(brand_only) not in _normalize_for_match(keyword):
-            # "에프킬라" + 원본 키워드 핵심부
-            boosted.append(f"{brand_only} {keyword}")
-            boosted.append(brand_only)
-        candidates = boosted + candidates
+        if _normalize_for_match(brand_only) not in _normalize_for_match(original):
+            candidates = [f"{brand_only} {original}", brand_only] + candidates
 
-    # 일반명사로 떨어지는 단축 후보 제거
-    filtered: list[str] = []
-    for c in candidates:
-        if _is_too_generic(c):
-            continue
-        filtered.append(c)
-    # 모두 제거됐다면 brand_only만 남기거나, 원본 유지
-    if not filtered:
-        filtered = [brand_hint] if brand_hint else [keyword]
+    # 일반명사 가드
+    candidates = [c for c in candidates if not _is_too_generic(c)]
+    if not candidates:
+        candidates = [brand_hint] if brand_hint else [original]
 
-    for candidate in filtered:
+    for candidate in candidates:
         results = fetch_ecolife_results(candidate)
-        if results:
-            return results, candidate
-    return [], keyword
+        if not results:
+            continue
+        # 원본 검색어 기준 유사도 필터 + 점수순 정렬
+        scored = [(r, _name_similarity(original, r.product_name)) for r in results]
+        kept = [(r, s) for r, s in scored if s >= min_similarity]
+        if kept:
+            kept.sort(key=lambda x: -x[1])
+            return [r for r, _ in kept], candidate
+
+    return [], original
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -933,15 +950,30 @@ with st.spinner(f"초록누리에서 `{query}` 검색 중..."):
     results, used_keyword = fetch_ecolife_smart(query, brand_hint=brand_hint)
 
 if not results:
-    st.warning(
-        "초록누리에서 일치하는 결과를 찾지 못했어요. "
-        "검색어를 더 짧게(브랜드명만) 입력하거나, 라벨의 승인번호로 검색해보세요."
-    )
-    st.link_button(
-        "🔗 초록누리 사이트에서 직접 확인",
-        ecolife_url(query),
-        use_container_width=True,
-    )
+    st.warning("**초록누리에서 정확히 일치하는 제품을 찾지 못했어요.**")
+    tips = [
+        "**라벨의 승인번호**(예: `3219-0052`, `CB22-12-2426`)로 직접 검색 — 가장 정확",
+        "검색어 칸에 라벨에 적힌 **정식 상품명** 직접 입력 — POS 명칭이 정식명과 다를 수 있음",
+    ]
+    if brand_hint:
+        tips.append(
+            f"같은 브랜드 **{brand_hint}** 의 승인 살충제 전체 목록은 아래 링크로 확인"
+        )
+    st.markdown("\n".join(f"- {t}" for t in tips))
+    cols = st.columns(2 if brand_hint else 1)
+    with cols[0]:
+        st.link_button(
+            "🔗 초록누리에서 직접 확인",
+            ecolife_url(query),
+            use_container_width=True,
+        )
+    if brand_hint:
+        with cols[1]:
+            st.link_button(
+                f"🔗 '{brand_hint}' 브랜드 검색",
+                ecolife_url(brand_hint),
+                use_container_width=True,
+            )
     st.stop()
 
 # 결과 헤더 — 단축 검색이 적용된 경우 알림
