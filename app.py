@@ -251,6 +251,82 @@ def lookup_master_name(barcode: str) -> str | None:
     return load_master_db().get(barcode.strip())
 
 
+# ─────────────────────────── 제조사 조치 현황 ───────────────────────────
+# 출처: 약사회 공지 (2026-06-19 기준) + 제조사 공문 (종근당, 유한양행, 동성제약).
+# 사용자 = 약사이므로 브랜드별 회수·반품 진행 상태를 매장에서 즉시 확인 가능하게.
+
+MANUFACTURER_STATUS: dict[str, dict[str, str]] = {
+    "에프킬라": {
+        "company": "SC존슨 / 태극제약",
+        "status": "✅ 회수·교환 진행 중",
+        "detail": "6.15(월)부터 영업사원을 통한 약국 회수·교환 진행. 구형/신형 패키지로 구분.",
+    },
+    "비오킬": {
+        "company": "동성제약",
+        "status": "🚫 7.1부터 판매 금지",
+        "detail": "주성분 미승인. 6.30까지 정상 판매 가능. 7.1부터 판매·유통·진열·보관 전면 중단. 보유 재고 전량 반품 대상.",
+    },
+    "홈키파": {
+        "company": "헨켈 / 동화약품",
+        "status": "⏳ 조치 검토 중",
+        "detail": "제조사 안내 미발표. 보유 시 주의. 약사회에서 신속 조치 촉구 중.",
+    },
+    "컴배트": {
+        "company": "헨켈 / 동화약품",
+        "status": "⏳ 조치 검토 중",
+        "detail": "제조사 안내 미발표. 보유 시 주의.",
+    },
+    "해피홈": {
+        "company": "유한양행",
+        "status": "🚫 8개 품목 판매불가 확정",
+        "detail": "2026.7.1 이후 보관·유통·판매 불가 제품 8종 통보 (반품 진행). 그 외 신형 패키지는 정상 판매.",
+    },
+    "쫑": {
+        "company": "종근당",
+        "status": "🚫 7.1부터 판매 금지",
+        "detail": "쫑에스에어졸, 쫑바퀴에어졸 — 제조 2025.12.31 / 판매 2026.6.30 / 7.1부터 회수·과태료 대상.",
+    },
+}
+
+
+# 명시적으로 판매불가 확정된 제품 — 약국 DB가 모호하거나 누락된 경우 보강
+# (제조사 공문 기반 — 코드 또는 정확 상품명 매칭)
+DISCONTINUED_BY_CODE: dict[str, dict[str, str]] = {
+    # 유한양행 해피홈 — 2026.7.1 이후 판매 불가
+    "A300388": {"name": "해피홈 에어로솔 수성 무향 500ml", "reason": "유한양행 공문 (2026-06-17)"},
+    "A300401": {"name": "해피홈 에어로솔 수성 피톤치드향 500ml", "reason": "유한양행 공문 (2026-06-17)"},
+    "A300395": {"name": "해피홈 에어로솔 수성 감귤향 500ml", "reason": "유한양행 공문 (2026-06-17)"},
+    "A252151": {"name": "해피홈 바퀴에어로솔 (약국용)", "reason": "유한양행 공문 (2026-06-17)"},
+    "A308391": {"name": "해피홈 파워매트 30매(N)", "reason": "유한양행 공문 — 구형 한정 (신형 파워매트에스는 정상)"},
+    "A308407": {"name": "해피홈 파워매트 60매(N)", "reason": "유한양행 공문 — 구형 한정 (신형 파워매트에스는 정상)"},
+    "A308421": {"name": "해피홈 리퀴드 45일 45ml(N)", "reason": "유한양행 공문 — 구형 한정 (신형 파워리퀴드에스 60일은 정상)"},
+    "A308414": {"name": "해피홈 리퀴드 컴바인(New)", "reason": "유한양행 공문 — 구형 한정"},
+}
+
+
+def lookup_discontinued(code: str, name: str) -> dict[str, str] | None:
+    """제품코드 또는 상품명으로 명시 판매불가 매핑 조회."""
+    if code and code.strip() in DISCONTINUED_BY_CODE:
+        return DISCONTINUED_BY_CODE[code.strip()]
+    if name:
+        norm = _normalize_for_match(name) if "_normalize_for_match" in globals() else name.replace(" ", "").lower()
+        for c, info in DISCONTINUED_BY_CODE.items():
+            if _normalize_for_match(info["name"]) == norm if "_normalize_for_match" in globals() else False:
+                return info
+    return None
+
+
+def get_manufacturer_status_for(name_or_brand: str) -> dict[str, str] | None:
+    """상품명/브랜드 텍스트에서 알려진 브랜드 찾기."""
+    if not name_or_brand:
+        return None
+    norm = name_or_brand.replace(" ", "").lower()
+    for brand, info in MANUFACTURER_STATUS.items():
+        if brand.lower() in norm:
+            return {"brand": brand, **info}
+    return None
+
+
 # 검색어로 떨어지면 안 되는 너무 일반적인 단어 (살충제 분야 일반명사)
 _GENERIC_TERMS = {
     "바퀴", "모기", "벌레", "곤충", "용도", "용기", "살충", "방충", "기피", "제거",
@@ -755,6 +831,62 @@ ss.setdefault("db_entry", None)
 st.markdown("### 🪲 살충제 판매제한 조회")
 st.caption("바코드 스캔 → 자동으로 초록누리(ecolife) 결과 표시")
 
+# 긴급 시한 배너
+from datetime import date as _date
+_today = _date.today()
+_d_sales = (_date(2026, 6, 30) - _today).days
+_d_ban = (_date(2026, 7, 1) - _today).days
+if _d_ban > 0:
+    st.markdown(
+        f"""
+        <div style="background:#fef3c7;border-left:6px solid #d97706;padding:10px 14px;
+                    border-radius:8px;margin-bottom:10px;font-size:0.93rem;">
+            <b>⏰ D-{_d_sales}일</b> · 미승인 살생물제 판매 가능 마지막날: <b>2026.6.30(화)</b><br>
+            <b>🚫 D-{_d_ban}일</b> · 7.1부터 판매·진열·보관 전면 금지 (위반 시 3년 이하 징역 또는 3천만원 이하 벌금)
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        """
+        <div style="background:#fee2e2;border-left:6px solid #dc2626;padding:10px 14px;
+                    border-radius:8px;margin-bottom:10px;font-size:0.93rem;">
+            <b>🚫 미승인 살생물제 판매·진열·보관 전면 금지 시행 중</b> (위반 시 3년 이하 징역 또는 3천만원 이하 벌금)
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# 약사회 공지·제조사 조치 현황 (접기)
+with st.expander("📢 약사회 공지 · 제조사별 조치 현황 (6.19 기준)", expanded=False):
+    st.markdown(
+        """
+        **배경** — 화학제품안전법 개정으로 모기·바퀴·개미 제거제 등 보건용 살충제가 살생물제품으로 관리전환.
+        승인받지 못한 제품은 2026.6.30까지만 판매 가능, 7.1부터 판매·진열·보관 전면 금지.
+        판매 약국도 처벌 대상 (3년 이하 징역 또는 3천만원 이하 벌금, 신고 포상금 제도 있음).
+
+        **약국에서 할 일**
+        1. 진열대·창고의 액상/매트/스프레이 살충제 전수 점검 (홈매트, 에프킬라, 비오킬, 컴배트, 홈키파, 해피홈 등)
+        2. 상품명을 [초록누리](https://ecolife.mcee.go.kr/ecolife/biocideProdInfoRls/biocideProdInfoRls?pMENU_NO=2139)에서 검색 → 목록에 없으면 미승인
+        3. 미승인 제품은 6.30까지 소진 또는 반품, 7.1부터 매대 철수 + 별도 보관
+
+        **제조사별 조치 현황**
+        """
+    )
+    for brand, info in MANUFACTURER_STATUS.items():
+        st.markdown(
+            f"- **{brand}** ({info['company']}) — {info['status']}  \n  {info['detail']}"
+        )
+    st.markdown(
+        """
+        ---
+        **관련 기사**
+        - [약사공론 1](https://www.kpanews.co.kr/news/articleView.html?idxno=536634)
+        - [약사공론 2](https://www.kpanews.co.kr/news/articleView.html?idxno=536930)
+        """
+    )
+
 # 로드 상태 — 살충제 DB(시트) + 약국 마스터(로컬) + 네이버 API
 _db = load_product_db()
 _master = load_master_db()
@@ -893,6 +1025,29 @@ with st.container():
 
 # ── 결과 영역 ──
 
+# 0) 명시적 판매중단 확정 매핑 — A코드 또는 정확 상품명 (최우선)
+_db_entry_for_disc: ProductDBEntry | None = ss.get("db_entry")
+_disc_info = None
+if _db_entry_for_disc:
+    # POS DB 행에는 A코드가 표준바코드 컬럼이 아니라 별도 컬럼일 수도, 일단 상품명만 활용
+    _disc_info = lookup_discontinued("", _db_entry_for_disc.name)
+
+if _disc_info:
+    st.markdown(
+        f"""
+        <div class="card" style="border-left:6px solid #dc2626; background:#fee2e2;">
+            <div style="font-size:0.85rem;font-weight:600;color:#dc2626;margin-bottom:4px;">
+                🚫 제조사 공문 확정 — 판매 불가
+            </div>
+            <div style="font-size:1.3rem;font-weight:800;color:#dc2626;margin-bottom:6px;">
+                {_disc_info['name']}
+            </div>
+            <div class="meta"><b>근거</b>: {_disc_info['reason']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # 1) 약국 DB 매칭 결과 우선 표시 (있으면)
 db_entry: ProductDBEntry | None = ss.get("db_entry")
 if db_entry:
@@ -928,6 +1083,34 @@ if db_entry:
                 {icon} {status_label}
             </div>
             <div class="meta">{detail_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# 1.5) 제조사 조치 현황 — 브랜드가 추정/식별된 경우 항상 표시
+_mfg_lookup_src = ""
+if db_entry:
+    _mfg_lookup_src += " " + db_entry.name + " " + (db_entry.matched_approval or "")
+if ss.get("last_scanned"):
+    _brand_hint = infer_brand_from_prefix(ss.last_scanned)
+    if _brand_hint:
+        _mfg_lookup_src += " " + _brand_hint
+if ss.get("query"):
+    _mfg_lookup_src += " " + ss.query
+
+_mfg_info = get_manufacturer_status_for(_mfg_lookup_src)
+if _mfg_info:
+    st.markdown(
+        f"""
+        <div class="card" style="border-left:6px solid #4338ca; background:#eef2ff;">
+            <div style="font-size:0.85rem;font-weight:600;color:#4338ca;margin-bottom:4px;">
+                🏭 제조사 조치 현황 — <b>{_mfg_info['brand']}</b> ({_mfg_info['company']})
+            </div>
+            <div style="font-size:1.05rem;font-weight:700;color:#1f2937;margin:4px 0 6px;">
+                {_mfg_info['status']}
+            </div>
+            <div class="meta">{_mfg_info['detail']}</div>
         </div>
         """,
         unsafe_allow_html=True,
